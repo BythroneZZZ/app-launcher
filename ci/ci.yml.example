@@ -1,0 +1,39 @@
+# Rename this file to ci.yml to enable the workflow on GitHub Actions.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  logic-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile Python sources
+        run: python -m compileall -q launcher.py theme.py store.py build.py test_logic.py
+
+      - name: Run Qt-free logic tests
+        run: python test_logic.py
+
+      - name: Check for credentials and personal paths
+        shell: bash
+        run: |
+          if grep -rInE 'ghp_[A-Za-z0-9]{20,}|@(gmail|qq|outlook|163)[.]com' \
+              --exclude='ci.yml' --exclude-dir=.git .; then
+            echo "::error::Possible credential found"
+            exit 1
+          fi
+          if grep -rInF 'C:\Users\' --exclude='ci.yml' --exclude-dir=.git .; then
+            echo "::error::Possible personal path found"
+            exit 1
+          fi
+          echo "No credentials or personal paths found"

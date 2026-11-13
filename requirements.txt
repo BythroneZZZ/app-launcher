@@ -1,0 +1,6 @@
+# Windows 10/11, Python 3.10+ (verified on Python 3.11 + PySide6 6.12)
+PySide6>=6.6
+pywin32>=306
+
+# Optional: only needed for `python build.py`
+# pyinstaller>=6
