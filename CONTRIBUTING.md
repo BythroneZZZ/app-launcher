@@ -31,8 +31,11 @@ python test_logic.py            :: 纯逻辑单测，不需要 PySide6 / GUI
 ## 提交信息
 
 用简短的英文或中文祈使句，例如 `fix: keep cache entries in manual-only mode`。
-不要在提交信息、作者信息或文件内容里填写真实邮箱、姓名或本机路径。把
-把 `ci/ci.yml.example` 复制到 `.github/workflows/ci.yml` 即可启用 CI，其中包含一次凭据扫描。
+不要在提交信息、作者信息或文件内容里填写真实邮箱、姓名或本机路径。
+
+CI 已在 `.github/workflows/ci.yml` 启用：每次 push / PR 会在 Python 3.10 / 3.11 / 3.12
+上做语法编译检查、运行 Qt-free 逻辑测试，并扫描凭据与本机路径。提交前可本地运行
+`python test_logic.py` 预检；守卫规则本身写在 `ci.yml` 里，新增检测模式时记得同步排除该文件。
 
 ## 行为准则
 
