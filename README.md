@@ -79,10 +79,13 @@ python build.py                     :: 可选：PyInstaller 打包成 dist/AppLa
 
 ## 性能
 
-- 首次启动：全量扫描 + 4 线程提取图标，随后把元数据、主图与 40px 缩略图写入缓存
+- 首次启动：全量扫描 + 4 线程提取图标（IID 修正后 SHGetImageList 真正生效），随后把元数据、主图与 80px 缩略图写入缓存
 - 热启动：主要开销是读 JSON 与解码缩略图（约为 256px 图的 2%），缓存命中通常在一秒内
-- 参考量级：上百个快捷方式、SSD、Python 3.11 + PySide6 6.12 环境下，冷启动约 1–3s、
-  热启动约 0.2–0.5s。数值取决于快捷方式数量、磁盘缓存与机器性能，**不是性能保证**
+- 参考量级（本机 144 应用 / SSD / PySide6 6.12，**测量起点 = 扫描线程启动，终点 = done 信号**，
+  不含窗口构造与首帧渲染）：冷扫约 2.4–4.7s、热启动约 0.2–0.5s。
+  UWP 列表落盘缓存（uwp_cache.json，24h TTL 跨进程），热启动不再含 COM 枚举。
+  **注意**：IID 修正后首次启动会触发 v2→v3 缓存迁移（全量重提 256px 图标，约多 1–2s），之后恢复热启动速度。
+  数值取决于快捷方式数量、磁盘缓存与机器性能，**不是性能保证**
 - 实现上用了 `constBits()` 批量读像素、卡面预渲染、背景位图缓存、视口外卡面释放、
   动画组即用即毁，以控制 CPU 光栅下的重绘成本
 
@@ -98,7 +101,9 @@ python build.py                     :: 可选：PyInstaller 打包成 dist/AppLa
 
 | 文件 | 作用 |
 |---|---|
-| `launcher.py` | 主窗口、卡片、绘制、扫描与添加线程、交互、单实例 IPC |
+| `launcher.py` | 主窗口、卡片绘制、交互、单实例 IPC、托盘、日志 |
+| `scan.py` | 扫描与图标提取（COM/UWP/并行/缓存路径/Workers） |
+| `background.qml` | GPU 加速背景层（渐变 + 噪点 + 暗角 + 辉光；`AL_QML=1` 启用） |
 | `theme.py` | 视觉 / 动效 / 布局 token（Qt-free，唯一事实来源） |
 | `store.py` | 元数据与配置读写、缓存合并（Qt-free） |
 | `build.py` | 可选的 PyInstaller 打包脚本 |
@@ -110,8 +115,8 @@ python build.py                     :: 可选：PyInstaller 打包成 dist/AppLa
 ## 已知边界
 
 - 仅支持 Windows；依赖系统 Shell COM、开始菜单目录结构与 `shell:AppsFolder`
-- UWP 图标优先取 `IShellItemImageFactory` 的 256px；接口被环境拒绝时退回 64px hIcon，
-  再失败走首字母占位；UWP 显示名以 Windows 报告为准
+- UWP 图标优先走 `IShellItemImageFactory::GetImage` 256px（IID 实测修正为 BCC18B79）；
+  接口不可用时退回 64px hIcon，再失败走首字母占位；UWP 显示名以 Windows 报告为准
 - 以管理员权限运行的程序，从卡片启动默认不带提权
 - 高 DPI、多显示器与非英文分类名的覆盖还不完整，欢迎反馈
 

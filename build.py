@@ -22,9 +22,16 @@ def main():
         '--exclude-module', 'matplotlib',
         '--exclude-module', 'numpy',
         '--exclude-module', 'IPython',
+        # QML 背景层资源（AL_QML=1 时加载）
+        '--add-data', os.path.join(root, 'background.qml') + os.pathsep + '.',
         os.path.join(root, 'launcher.py'),
     ]
     print(' '.join(cmd))
+    # 语法检查（含 scan.py，防止 CI/compileall 漏覆盖）
+    import py_compile
+    for f in ('launcher.py', 'scan.py', 'store.py', 'theme.py'):
+        py_compile.compile(os.path.join(root, f), doraise=True)
+    print('语法检查通过')
     subprocess.check_call(cmd, cwd=root)
     out = os.path.join(root, 'dist', 'AppLauncher')
     print()

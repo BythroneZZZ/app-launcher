@@ -16,30 +16,33 @@
 依赖: pip install PySide6 pywin32
 """
 import ctypes
-import ctypes.wintypes as wt
-import hashlib
 import html
 import logging
 import math
 import os
 import random
-import re
 import shutil
 import sys
-import threading
 import time
 from datetime import datetime
 
-from store import (load_meta, save_meta, merge_meta, load_custom_store,
-                   save_custom_store, prune_recent, CACHE_DIR, ICON_DIR)
-from PySide6.QtCore import (Qt, QTimer, QThread, Signal, Property, QPoint, QPointF,
-                            QRectF, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup)
+from store import (load_custom_store, save_custom_store, prune_recent,
+                   CACHE_DIR)
+from PySide6.QtCore import (Qt, QTimer, QEvent, Property, QPoint, QPointF,
+                            QRectF, QEasingCurve, QPropertyAnimation, QParallelAnimationGroup,
+)
 from PySide6.QtGui import (QColor, QFont, QIcon, QImage, QLinearGradient, QPainter,
                            QPainterPath, QPen, QPixmap, QRadialGradient, QBrush)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget,
                                QGraphicsOpacityEffect, QMenu, QFileDialog)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+# 扫描逻辑在 scan.py（独立模块，可单独测试）；以下为 launcher 需要的 re-export
+from scan import (ScanWorker, AddWorker, build_uwp_app, enumerate_uwp_apps, uwp_icon_image,      # noqa: F401
+                  resolve_lnk, JUNK, UWP_ENABLED, UWP_CAT,   # noqa: F401
+                  muted_tint, _trim_icon_border,             # noqa: F401
+                  ICON_DIR)                                  # noqa: F401
 
 try:
     import pythoncom
@@ -100,784 +103,7 @@ def _activate_running_instance():
         return False
 
 # ============================================================
-# 快捷方式解析（pywin32 可选）
-# ============================================================
-_shell_tls = threading.local()
-def resolve_lnk(path):
-    if not HAVE_COM:
-        return '', '', ''
-    try:
-        shell = getattr(_shell_tls, 'shell', None)
-        if shell is None:
-            pythoncom.CoInitialize()
-            shell = win32com.client.Dispatch('WScript.Shell')
-            _shell_tls.shell = shell
-        s = shell.CreateShortCut(path)
-        return (s.Targetpath or '', s.Arguments or '', s.WorkingDirectory or '')
-    except Exception:
-        return '', '', ''
-
-# ============================================================
-# 图标提取（ctypes: SHGetFileInfo + 共享 ImageList → QImage）
-# ============================================================
-_user32 = ctypes.windll.user32
-_gdi32 = ctypes.windll.gdi32
-_shell32 = ctypes.windll.shell32
-
-class SHFILEINFOW(ctypes.Structure):
-    _fields_ = [('hIcon', wt.HICON), ('iIcon', ctypes.c_int), ('dwAttributes', ctypes.c_uint),
-                ('szDisplayName', ctypes.c_wchar * 260), ('szTypeName', ctypes.c_wchar * 80)]
-
-SHGFI_SYSICONINDEX = 0x4000
-SHIL_EXTRALARGE = 0x2
-SHIL_JUMBO = 0x4
-ILD_NORMAL = 0x0
-DI_NORMAL = 0x3
-IID_IIMAGELIST = (ctypes.c_ubyte * 16)(0x26, 0x59, 0xEB, 0x46, 0x2E, 0x58, 0x17, 0x40,
-                                       0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x5B)
-
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [('biSize', ctypes.c_uint32), ('biWidth', ctypes.c_int32), ('biHeight', ctypes.c_int32),
-                ('biPlanes', ctypes.c_uint16), ('biBitCount', ctypes.c_uint16), ('biCompression', ctypes.c_uint32),
-                ('biSizeImage', ctypes.c_uint32), ('biXPelsPerMeter', ctypes.c_int32),
-                ('biYPelsPerMeter', ctypes.c_int32), ('biClrUsed', ctypes.c_uint32), ('biClrImportant', ctypes.c_uint32)]
-
-class BITMAPINFO(ctypes.Structure):
-    _fields_ = [('bmiHeader', BITMAPINFOHEADER), ('bmiColors', ctypes.c_uint32 * 3)]
-
-def _has_alpha(img):
-    try:
-        buf = img.constBits()
-        return any(buf[3::4])
-    except Exception:
-        for y in range(0, img.height(), 4):
-            for x in range(0, img.width(), 4):
-                if (img.pixel(x, y) >> 24) & 0xFF:
-                    return True
-    return False
-
-def _hicon_to_qimage(hicon, size):
-    img = None
-    hdc = _user32.GetDC(None)
-    mem = None
-    dib = None
-    try:
-        mem = _gdi32.CreateCompatibleDC(hdc)
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = size
-        bmi.bmiHeader.biHeight = -size
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = 0
-        bits = ctypes.c_void_p()
-        dib = _gdi32.CreateDIBSection(hdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        if dib and bits:
-            old = _gdi32.SelectObject(mem, dib)
-            _user32.DrawIconEx(mem, 0, 0, hicon, size, size, 0, None, DI_NORMAL)
-            _gdi32.SelectObject(mem, old)
-            buf = ctypes.string_at(bits, size * size * 4)
-            qimg = QImage(buf, size, size, size * 4, QImage.Format_ARGB32)
-            img = qimg.copy()
-            if not _has_alpha(img):
-                img = img.convertToFormat(QImage.Format_RGB32)
-    finally:
-        if dib:
-            _gdi32.DeleteObject(dib)
-        if mem:
-            _gdi32.DeleteDC(mem)
-        _user32.ReleaseDC(None, hdc)
-    return img
-
-def extract_icon(path, size=256, _il_cache={}, _il_lock=threading.Lock()):
-    try:
-        shfi = SHFILEINFOW()
-        ok = _shell32.SHGetFileInfoW(path, 0, ctypes.byref(shfi), ctypes.sizeof(SHFILEINFOW),
-                                     SHGFI_SYSICONINDEX)
-        if not ok:
-            return None
-        for shil in (SHIL_JUMBO, SHIL_EXTRALARGE):
-            with _il_lock:                 # 并行提取线程共享此缓存：加锁防双重初始化
-                il = _il_cache.get(shil)
-                if not il:
-                    il = ctypes.c_void_p()
-                    hr = _shell32.SHGetImageList(shil, ctypes.byref(IID_IIMAGELIST), ctypes.byref(il))
-                    if hr != 0 or not il:
-                        continue
-                    _il_cache[shil] = il
-            hicon = ctypes.windll.comctl32.ImageList_GetIcon(il, shfi.iIcon, ILD_NORMAL)
-            if not hicon:
-                continue
-            img = _hicon_to_qimage(hicon, size)
-            _user32.DestroyIcon(hicon)
-            if img and not img.isNull():
-                return img
-    except Exception:
-        pass
-    return None
-
-def icon_for_path(path, size=256):
-    img = extract_icon(path, size)
-    if img:
-        return img
-    try:
-        from PySide6.QtWidgets import QFileIconProvider
-        from PySide6.QtCore import QFileInfo
-        ic = QFileIconProvider().icon(QFileInfo(path))
-        if not ic.isNull():
-            pm = ic.pixmap(size, size)
-            if not pm.isNull():
-                return pm.toImage()
-    except Exception:
-        pass
-    return None
-
-# ============================================================
-# UWP / 商店应用（shell:AppsFolder 枚举 + IShellItemImageFactory 图标）
-# ============================================================
-UWP_ENABLED = os.environ.get('AL_UWP', '1') != '0'   # AL_UWP=0 可关闭（部分测试用）
-UWP_CAT = '商店应用'
-IID_ISHELLITEMIMAGEFACTORY = (ctypes.c_ubyte * 16)(
-    0x9f, 0x8b, 0xc1, 0xbc, 0x3e, 0xb4, 0xe4, 0x44,
-    0x9f, 0x7f, 0x33, 0xde, 0x4b, 0xc4, 0xd3, 0xcd)
-
-class _BITMAP(ctypes.Structure):
-    _fields_ = [('bmType', ctypes.c_long), ('bmWidth', ctypes.c_long),
-                ('bmHeight', ctypes.c_long), ('bmWidthBytes', ctypes.c_long),
-                ('bmPlanes', ctypes.c_uint16), ('bmBitsPixel', ctypes.c_uint16),
-                ('bmBits', ctypes.c_void_p)]
-
-def _hbitmap_to_qimage(hbmp):
-    """GDI HBITMAP(32bpp) → QImage（GetImage 返回预乘 ARGB，底朝上时翻转）"""
-    try:
-        bm = _BITMAP()
-        if not _gdi32.GetObjectW(hbmp, ctypes.sizeof(_BITMAP), ctypes.byref(bm)):
-            return None
-        w, h = bm.bmWidth, abs(bm.bmHeight)
-        if w <= 0 or h <= 0 or bm.bmBitsPixel != 32 or not bm.bmBits:
-            return None
-        buf = ctypes.string_at(bm.bmBits, bm.bmWidthBytes * h)
-        img = QImage(buf, w, h, bm.bmWidthBytes, QImage.Format_ARGB32_Premultiplied)
-        img = img.copy()
-        if bm.bmHeight > 0:
-            img = img.mirrored(False, True)
-        return img.convertToFormat(QImage.Format_ARGB32)
-    except Exception:
-        return None
-
-def uwp_icon_image(aumid, size=256):
-    """UWP 应用图标。
-       路线 1：IShellItemImageFactory::GetImage（256px 高清，正常 Windows 可用）；
-       路线 2：SHGetFileInfoW(PIDL, SHGFI_ICON) → hIcon —— 对 COM 环境限制免疫，实测 8/8。
-       两路都失败 → None（首字母占位兜底）。"""
-    if not HAVE_COM:
-        return None
-    pidl = ctypes.c_void_p()
-    try:
-        hr = _shell32.SHParseDisplayName(ctypes.c_wchar_p('shell:AppsFolder\\' + aumid),
-                                         None, ctypes.byref(pidl), 0, None)
-        if hr != 0 or not pidl:
-            return None
-
-        # 路线 1：IShellItemImageFactory::GetImage
-        ppv = ctypes.c_void_p()
-        hr = _shell32.SHCreateItemFromIDList(pidl, IID_ISHELLITEMIMAGEFACTORY,
-                                             ctypes.byref(ppv))
-        if hr == 0 and ppv:
-            hbmp = ctypes.c_void_p()
-            try:
-                vt = ctypes.cast(ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p)).contents,
-                                 ctypes.POINTER(ctypes.c_void_p * 16)).contents
-                gi = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p,
-                                        ctypes.c_uint, ctypes.c_uint,
-                                        ctypes.POINTER(ctypes.c_void_p))(vt[3])
-                hr = gi(ppv, size, 0, ctypes.byref(hbmp))
-                if hr == 0 and hbmp:
-                    img = _hbitmap_to_qimage(hbmp)
-                    if img is not None and not img.isNull():
-                        return img
-            finally:
-                if hbmp:
-                    _gdi32.DeleteObject(hbmp)
-                try:                            # IUnknown::Release
-                    rel = ctypes.cast(ctypes.cast(ppv, ctypes.POINTER(ctypes.c_void_p)).contents,
-                                      ctypes.POINTER(ctypes.c_void_p * 16)).contents[2]
-                    ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(rel)(ppv)
-                except Exception:
-                    pass
-
-        # 路线 2：SHGetFileInfoW(PIDL, SHGFI_ICON) → hIcon（32/64px，质量足够芯片显示）
-        sfi = SHFILEINFOW()
-        hr = _shell32.SHGetFileInfoW(pidl, 0, ctypes.byref(sfi), ctypes.sizeof(SHFILEINFOW),
-                                     0x100 | 0x8)   # SHGFI_ICON | SHGFI_PIDL
-        if hr != 0 and sfi.hIcon:
-            img = _hicon_to_qimage(sfi.hIcon, 64)
-            _user32.DestroyIcon(sfi.hIcon)
-            if img is not None and not img.isNull():
-                return img
-        return None
-    finally:
-        if pidl:
-            ctypes.windll.ole32.CoTaskMemFree(pidl)
-
-def enumerate_uwp_apps():
-    """枚举 shell:AppsFolder 里的 UWP/商店应用 → [(name, aumid)]
-       AUMID 判定：Path 含 '!' 且无盘符/反斜杠/::（桌面 exe 与 Control Panel 项被排除）"""
-    if not HAVE_COM:
-        return []
-    out, seen = [], set()
-    try:
-        shell = win32com.client.Dispatch('Shell.Application')
-        folder = shell.NameSpace('shell:AppsFolder')
-        for item in folder.Items():
-            try:
-                path = item.Path
-                name = item.Name
-            except Exception:
-                continue
-            if not path or not name:
-                continue
-            if ('!' not in path or '\\' in path or ':' in path
-                    or path.startswith('::')):
-                continue
-            if path in seen:
-                continue
-            seen.add(path)
-            out.append((name, path))
-    except Exception:
-        return []
-    return out
-
-def build_uwp_app(name, aumid, mt=0):
-    """UWP 应用卡片数据：target=AUMID，启动走 shell:AppsFolder；图标/缩略图/主色同管线"""
-    img = uwp_icon_image(aumid)
-    img = _trim_icon_border(img)
-    tint = dominant_tint(img)
-    icon_file = None
-    thumb_file = None
-    if img is not None:
-        big = img.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation) \
-            if (img.width() > 160 or img.height() > 160) else img
-        icon_file = _icon_cache_path('uwp:' + aumid)
-        big.save(icon_file, 'PNG')
-        thumb_file = _thumb_cache_path('uwp:' + aumid)
-        img.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation).save(thumb_file, 'PNG')
-    app = {'name': name, 'lnk': 'uwp:' + aumid, 'cat': UWP_CAT,
-           'target': aumid, 'mtime': '', 'img': img, 'tint': tint,
-           'icon_file': os.path.basename(icon_file) if icon_file else None,
-           'thumb_file': os.path.basename(thumb_file) if thumb_file else None}
-    entry = {'mt': mt, 'name': name, 'cat': UWP_CAT, 'target': aumid, 'mtime': '',
-             'icon': os.path.basename(icon_file) if icon_file else None,
-             'thumb': os.path.basename(thumb_file) if thumb_file else None,
-             'noicon': img is None, 'tint': tint.name(), 'v': 2, 'uwp': 1}
-    return app, entry
-
-# ============================================================
-# 主色提取 + 降饱和（视觉 token）
-# ============================================================
-def dominant_tint(img):
-    if img is None or img.isNull():
-        return QColor(ACCENT)
-    small = img.scaled(14, 14).convertToFormat(QImage.Format_RGB32)
-    try:
-        buf = small.constBits()
-        stride = small.bytesPerLine()
-        buckets = {}
-        for y in range(small.height()):
-            row = y * stride
-            for x in range(small.width()):
-                i = row + x * 4
-                b, g, r = buf[i], buf[i + 1], buf[i + 2]
-                mx = max(r, g, b)
-                mn = min(r, g, b)
-                if mx == 0 or (mx - mn) * 100 // mx < 18 or mx < 30:
-                    continue
-                h, s, v = QColor(r, g, b).getHsvF()
-                if s < 0.18 or v < 0.12:
-                    continue
-                key = int((h if h >= 0 else 0.62) * 12) % 12
-                e = buckets.setdefault(key, [0, 0, 0, 0])
-                e[0] += 1
-                e[1] += r; e[2] += g; e[3] += b
-    except Exception:
-        return QColor(ACCENT)
-    if not buckets:
-        return QColor(ACCENT)
-    best = max(buckets.values(), key=lambda e: e[0])
-    col = QColor(best[1] // best[0], best[2] // best[0], best[3] // best[0])
-    if col.valueF() > 0.92:
-        col = col.darker(115)
-    if col.valueF() < 0.45:
-        col = col.lighter(140)
-    return col
-
-def muted_tint(color):
-    """主色压饱和：S≤0.45，V 限定 0.55–0.70"""
-    c = QColor(color)
-    h, s, v, _a = c.getHsvF()
-    s = min(s if s >= 0 else 0.35, 0.45)
-    v = min(0.70, max(0.55, v))
-    c.setHsvF(h if h >= 0 else 0.58, s, v)
-    return c
-
-# ============================================================
-# 磁盘缓存
-# ============================================================
-def _icon_cache_path(lnk):
-    h = hashlib.md5(lnk.lower().encode('utf-8')).hexdigest()[:16]
-    return os.path.join(ICON_DIR, h + '_c.png')
-
-def _thumb_cache_path(lnk):
-    h = hashlib.md5(lnk.lower().encode('utf-8')).hexdigest()[:16]
-    return os.path.join(ICON_DIR, h + '_t.png')
-
-def _trim_icon_border(img):
-    """裁掉图标四周的纯色/透明边（如白边 letterbox），让内容铺满芯片。
-       用 64×64 缩略图找内容 bbox，按比例映射回原图裁剪。
-       仅当 bbox 面积占 25%–97% 时裁剪（太小=噪声，太满=无需裁）。"""
-    try:
-        if img is None or img.isNull():
-            return img
-        small = img.scaled(64, 64, Qt.IgnoreAspectRatio,
-                           Qt.SmoothTransformation).convertToFormat(QImage.Format_ARGB32)
-        w, h = small.width(), small.height()
-        buf = small.constBits()
-        stride = small.bytesPerLine()
-
-        def px(x, y):
-            i = y * stride + x * 4
-            return buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
-
-        corners = [px(0, 0), px(w - 1, 0), px(0, h - 1), px(w - 1, h - 1)]
-        cr = sum(c[0] for c in corners) // 4
-        cg = sum(c[1] for c in corners) // 4
-        cb = sum(c[2] for c in corners) // 4
-        ca = sum(c[3] for c in corners) // 4
-        TH = 28
-
-        def is_bg(x, y):
-            r, g, b, a = px(x, y)
-            return (abs(r - cr) <= TH and abs(g - cg) <= TH and
-                    abs(b - cb) <= TH and abs(a - ca) <= TH)
-
-        top = 0
-        while top < h and all(is_bg(x, top) for x in range(w)):
-            top += 1
-        if top >= h:
-            return img
-        bottom = h - 1
-        while bottom > top and all(is_bg(x, bottom) for x in range(w)):
-            bottom -= 1
-        left = 0
-        while left < w and all(is_bg(left, y) for y in range(top, bottom + 1)):
-            left += 1
-        right = w - 1
-        while right > left and all(is_bg(right, y) for y in range(top, bottom + 1)):
-            right -= 1
-
-        area = (right - left + 1) * (bottom - top + 1) / (w * h)
-        if area < 0.25 or area > 0.97:
-            return img
-        ow, oh = img.width(), img.height()
-        mx, my = max(1, ow // 50), max(1, oh // 50)
-        x0 = max(0, left * ow // w - mx)
-        y0 = max(0, top * oh // h - my)
-        x1 = min(ow, (right + 1) * ow // w + mx)
-        y1 = min(oh, (bottom + 1) * oh // h + my)
-        if x1 - x0 < ow * 0.2 or y1 - y0 < oh * 0.2:
-            return img
-        return img.copy(x0, y0, x1 - x0, y1 - y0)
-    except Exception:
-        return img
-
-
-def build_app(path, name, cat, mt=None, target=None):
-    """解析 lnk/exe → 应用卡片数据（目标 / 图标 / 主色 + 图标缓存）"""
-    if target is None:
-        target, _a, _w = resolve_lnk(path)
-    mt_src = target if (target and os.path.exists(target)) else path
-    try:
-        mtime = datetime.fromtimestamp(os.path.getmtime(mt_src)).strftime('%Y-%m-%d')
-    except Exception:
-        mtime = ''
-    img = icon_for_path(target if (target and os.path.exists(target)) else path, 256)
-    img = _trim_icon_border(img)          # 裁掉资源自带的白边/透明边
-    tint = dominant_tint(img)
-    icon_file = None
-    thumb_file = None
-    if img is not None:
-        # 缓存 160px 主图（Hero 大图尺寸，够用且比 256² 省一半解码）+ 40px 缩略图（热启动秒开）
-        big = img.scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation) \
-            if (img.width() > 160 or img.height() > 160) else img
-        icon_file = _icon_cache_path(path)
-        big.save(icon_file, 'PNG')
-        thumb_file = _thumb_cache_path(path)
-        img.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation).save(thumb_file, 'PNG')
-    app = {'name': name, 'lnk': path, 'cat': cat, 'target': target,
-           'mtime': mtime, 'img': img, 'tint': tint,
-           'icon_file': os.path.basename(icon_file) if icon_file else None,
-           'thumb_file': os.path.basename(thumb_file) if thumb_file else None}
-    if mt is None:
-        try:
-            mt = int(os.path.getmtime(path))
-        except OSError:
-            mt = 0
-    entry = {'mt': mt, 'name': name, 'cat': cat, 'target': target, 'mtime': mtime,
-             'icon': os.path.basename(icon_file) if icon_file else None,
-             'thumb': os.path.basename(thumb_file) if thumb_file else None,
-             'noicon': img is None, 'tint': tint.name(), 'v': 2}
-    return app, entry
-
-# ============================================================
-# 扫描线程（可取消 + 缓存加速）
-# ============================================================
-JUNK = re.compile(r'uninstall|卸载|unins\d|readme', re.I)
-
-class ScanWorker(QThread):
-    batch = Signal(list)
-    done = Signal(int, float)
-    EXTRACT_WORKERS = max(1, int(os.environ.get('AL_WORKERS', '4')))   # 并行提取线程数（实测 K=4 最优，可用 AL_WORKERS 调参）
-
-    def __init__(self, customs=None, hidden=None, scan_enabled=True):
-        super().__init__()
-        self._stop = False
-        self._customs = list(customs or [])
-        self._hidden = set(hidden or [])
-        self._scan_enabled = scan_enabled
-
-    def cancel(self):
-        self._stop = True
-
-    def run(self):
-        t0 = time.time()
-        if HAVE_COM:
-            try:
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-        try:
-            self._scan(t0)
-        except Exception:
-            logging.exception('扫描线程异常')
-        finally:
-            if HAVE_COM:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-
-    def _extract_parallel(self, tasks):
-        """K 线程并行 解析 lnk + 提取图标（冷启动主要耗时在此，并行度 ≈ 3x）。
-           返回 {full: (app, entry)}；JUNK 目标 / 失败的路径不在结果里。"""
-        from queue import Queue
-        qout = Queue()
-        cancel = threading.Event()
-        chunks = [tasks[i::self.EXTRACT_WORKERS] for i in range(self.EXTRACT_WORKERS)]
-        chunks = [c for c in chunks if c]
-
-        def extract(chunk):
-            if HAVE_COM:
-                try:
-                    pythoncom.CoInitialize()
-                except Exception:
-                    pass
-            try:
-                for full, name, cat, mt in chunk:
-                    if cancel.is_set():
-                        return
-                    try:
-                        if full.startswith('uwp:'):
-                            app, entry = build_uwp_app(name, full[4:])
-                        else:
-                            target, _a, _w = resolve_lnk(full)
-                            tlow = (target or '').lower()
-                            if tlow and JUNK.search(os.path.splitext(os.path.basename(tlow))[0] or ''):
-                                continue
-                            # 首扫只收录目标为 .exe 的应用；其余格式（文件夹/文档/URL 等）
-                            # 由用户「＋ 添加」或拖拽进入，不受此限。
-                            # 注意：Win11 应用执行别名（calc 等 reparse point）os.path.exists 为 False，
-                            # 因此只按扩展名判定，悬空 lnk 交由图标提取失败 → noicon 兜底。
-                            if not tlow.endswith('.exe'):
-                                continue
-                            app, entry = build_app(full, name, cat, mt, target=target)
-                        qout.put((full, app, entry))
-                    except Exception:
-                        continue
-            finally:
-                if HAVE_COM:
-                    try:
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
-                qout.put(None)            # 结束标记
-
-        threads = [threading.Thread(target=extract, args=(c,), daemon=True) for c in chunks]
-        for t in threads:
-            t.start()
-        results = {}
-        done_cnt = 0
-        while done_cnt < len(threads):
-            if self._stop:
-                cancel.set()
-            try:
-                item = qout.get(timeout=0.05)
-            except Exception:
-                if self._stop and qout.empty():
-                    break                 # 取消且队列已空：立即收尾
-                continue
-            if item is None:
-                done_cnt += 1
-            else:
-                full, app, entry = item
-                results[full] = (app, entry)
-        return results
-
-    def _scan(self, t0):
-        roots = []
-        for var in (r'%APPDATA%\Microsoft\Windows\Start Menu\Programs',
-                    r'%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs',
-                    r'%USERPROFILE%\Desktop',
-                    r'%PUBLIC%\Desktop'):
-            p = os.path.expandvars(var)
-            if os.path.isdir(p):
-                roots.append(p)
-        cache = load_meta()
-        meta_new = {}
-        seen_paths = set()
-        emitted = []                      # 统一发射流：customs + 扫描项按序混排（一处计数、一处补尾）
-        BATCH = 16
-        n_cached = 0
-        try:
-            os.makedirs(ICON_DIR, exist_ok=True)
-            for f in os.listdir(ICON_DIR):
-                # 只清“无后缀标记”的历史遗留缓存；_c/_t 都是现行缓存，不能动
-                if f.endswith('.png') and not (f.endswith('_c.png') or f.endswith('_t.png')):
-                    os.remove(os.path.join(ICON_DIR, f))
-        except Exception:
-            pass
-
-        # 1) 手动添加的应用（优先、置前）——并入统一发射流
-        for path in self._customs:
-            if self._stop:
-                break
-            if not os.path.exists(path):
-                continue
-            try:
-                lnk_mt = int(os.path.getmtime(path))
-            except OSError:
-                continue
-            name = os.path.splitext(os.path.basename(path))[0]
-            entry = cache.get(path)
-            app = None
-            if entry and entry.get('mt') == lnk_mt and (entry.get('icon') or entry.get('noicon')):
-                img = None
-                thumb_file = entry.get('thumb')
-                if thumb_file:
-                    img = QImage(os.path.join(ICON_DIR, thumb_file))
-                    if img.isNull():
-                        img = None
-                if img is None and entry.get('icon'):
-                    img = QImage(os.path.join(ICON_DIR, entry['icon']))
-                    if img.isNull():
-                        img = None
-                if img is not None or entry.get('noicon'):
-                    n_cached += 1
-                    meta_new[path] = entry
-                    app = {'name': entry['name'], 'lnk': path, 'cat': entry['cat'],
-                           'target': entry['target'], 'mtime': entry.get('mtime', ''),
-                           'img': img, 'tint': QColor(entry.get('tint') or ACCENT),
-                           'icon_file': entry.get('icon')}
-            if app is None:
-                app, entry2 = build_app(path, name, '自定义', lnk_mt)
-                meta_new[path] = entry2
-            seen_paths.add(path)
-            emitted.append(app)
-            if len(emitted) % BATCH == 0:
-                self.batch.emit(emitted[-BATCH:])
-
-        # 2) 收集候选（纯文件系统，快）：JUNK 名过滤 + mtime。
-        #    无视 scan_enabled/hidden 也收集：这些路径必须进 seen_paths，
-        #    否则「仅手动」会把全量缓存判过期、隐藏应用图标被当孤儿删光（P0-1）。
-        #    名称不再去重：同名同目标由 target 去重兜底，同名不同目标应都显示。
-        candidates = []                   # (full, name, cat, lnk_mt, hidden)
-        for root in roots:
-          if self._stop:
-            break
-          for dirpath, _dirs, files in os.walk(root):
-            if self._stop:
-                break
-            for fn in files:
-                if self._stop:
-                    break
-                if not fn.lower().endswith('.lnk'):
-                    continue
-                name = os.path.splitext(fn)[0].strip()
-                if not name or JUNK.search(name):
-                    continue
-                full = os.path.join(dirpath, fn)
-                try:
-                    lnk_mt = int(os.path.getmtime(full))
-                except OSError:
-                    continue
-                cat = '桌面'
-                if 'Start Menu' in root:
-                    rel = os.path.relpath(dirpath, root)
-                    cat = rel.split(os.sep)[0] if rel and rel != '.' else '应用'
-                candidates.append((full, name, cat, lnk_mt, full in self._hidden))
-
-        # UWP/商店应用（无视 scan_enabled 也枚举：进 seen_paths 保住缓存，与 P0-1 同理）
-        if UWP_ENABLED:
-            uwp_apps = enumerate_uwp_apps()
-            desktop_names = {c[1].casefold() for c in candidates}
-            for name, aumid in uwp_apps:
-                if name and name.casefold() not in desktop_names:
-                    candidates.append(('uwp:' + aumid, name, UWP_CAT, 0,
-                                       ('uwp:' + aumid) in self._hidden))
-        seen_paths.update(c[0] for c in candidates)   # 存在于磁盘 → 缓存一律保留
-
-        # 3) 缓存命中 + 并行提取 + 发射（仅全量模式；「仅手动」只出 customs）
-        if self._scan_enabled:
-            cand_paths = {c[0] for c in candidates if not c[4]}   # 未隐藏候选（dup 自愈依据）
-            ordered = []                  # (full, app, entry, lnk_mt)；app=None = 待提取或已记账重复
-            misses = []
-            for full, name, cat, lnk_mt, hidden in candidates:
-                if hidden:
-                    continue              # 隐藏项不提取不发射；缓存已由 seen_paths 保留
-                entry = cache.get(full)
-                app = None
-                is_dup = bool(entry and entry.get('mt') == lnk_mt and entry.get('dup'))
-                if is_dup and entry.get('primary') in cand_paths:
-                    ordered.append((full, None, entry, lnk_mt))
-                    continue              # 主 lnk 仍在候选中 → 继续记账跳过
-                if entry and entry.get('mt') == lnk_mt and not is_dup:
-                    # 非 .exe 目标：不发射；旧缓存条目由 seen_paths 保留（UWP 例外）
-                    if not full.startswith('uwp:') and \
-                            not (entry.get('target') or '').lower().endswith('.exe'):
-                        continue
-                    # v2 = 裁边后的缓存格式；旧版本缓存按未命中处理，自动迁移一次
-                    if entry.get('v') != 2:
-                        ordered.append((full, None, entry, lnk_mt))
-                        misses.append((full, name, cat, lnk_mt))
-                        continue
-                    # 缩略图优先：40px PNG 解码 ≈ 256px 的 2%；无缩略图退回大图
-                    img = None
-                    thumb_file = entry.get('thumb')
-                    if thumb_file:
-                        img = QImage(os.path.join(ICON_DIR, thumb_file))
-                        if img.isNull():
-                            img = None
-                    if img is None and entry.get('icon'):
-                        img = QImage(os.path.join(ICON_DIR, entry['icon']))
-                        if img.isNull():
-                            img = None
-                    if img is not None or entry.get('noicon'):
-                        n_cached += 1
-                        meta_new[full] = entry
-                        app = {'name': entry['name'], 'lnk': full, 'cat': entry['cat'],
-                               'target': entry['target'], 'mtime': entry.get('mtime', ''),
-                               'img': img, 'tint': QColor(entry.get('tint') or ACCENT),
-                               'icon_file': entry.get('icon')}
-                ordered.append((full, app, entry, lnk_mt))
-                if app is None:
-                    misses.append((full, name, cat, lnk_mt))
-
-            # 4) 并行提取（取消时及时收尾）
-            results = {}
-            if misses and not self._stop:
-                results = self._extract_parallel(misses)
-
-            # 5) 发射（target 去重统一在此；dup 记账带 primary，主 lnk 消失自动复活）
-            seen_targets = {}             # target_lower → 主 lnk 路径
-            for full, app, entry, lnk_mt in ordered:
-                if self._stop:
-                    break
-                if app is None:
-                    if entry is not None and entry.get('dup'):
-                        continue          # 记账随候选阶段保留，无需再写
-                    res = results.get(full)
-                    if res is None:       # 提取失败或目标被 JUNK 过滤
-                        continue
-                    app, entry = res
-                tlow = (app.get('target') or '').lower()
-                if tlow:
-                    if tlow in seen_targets:
-                        # 被去重的双子 lnk：记账（带 primary），主 lnk 消失时自动复活
-                        meta_new[full] = {'mt': lnk_mt, 'dup': 1, 'target': app['target'],
-                                          'primary': seen_targets[tlow]}
-                        continue
-                    seen_targets[tlow] = full
-                meta_new[full] = entry
-                emitted.append(app)
-                if len(emitted) % BATCH == 0:
-                    self.batch.emit(emitted[-BATCH:])
-
-        if not self._stop:
-            if emitted and len(emitted) % BATCH != 0:
-                self.batch.emit(emitted[len(emitted) - len(emitted) % BATCH:])
-            meta_new = merge_meta(cache, meta_new, seen_paths)
-            save_meta(meta_new)
-            try:                       # 清理孤儿图标（不再收录的路径残留的 PNG，含缩略图）
-                referenced = set()
-                for e in meta_new.values():
-                    if e.get('icon'):
-                        referenced.add(e['icon'])
-                    if e.get('thumb'):
-                        referenced.add(e['thumb'])
-                for f in os.listdir(ICON_DIR):
-                    if (f.endswith('_c.png') or f.endswith('_t.png')) and f not in referenced:
-                        os.remove(os.path.join(ICON_DIR, f))
-            except Exception:
-                pass
-            logging.info('[scan] 完成：%d 个快捷方式（缓存命中 %d），耗时 %.2fs',
-                           len(emitted), n_cached, time.time() - t0)
-        self.done.emit(len(emitted), time.time() - t0)
-
-class AddWorker(QThread):
-    """手动添加单个应用（图标提取放线程，避免卡 UI）"""
-    ready = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, path):
-        super().__init__()
-        self._path = path
-
-    def run(self):
-        if HAVE_COM:
-            try:
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-        try:
-            path = self._path
-            if not os.path.exists(path):
-                self.failed.emit('文件不存在')
-                return
-            name = os.path.splitext(os.path.basename(path))[0]
-            app, entry = build_app(path, name, '自定义')
-            if app['img'] is None:
-                self.failed.emit('无法提取该文件的图标（可改用它的快捷方式 .lnk）')
-                return
-            meta = load_meta()
-            meta[path] = entry
-            save_meta(meta)
-            store = load_custom_store()
-            if path not in store['customs']:
-                store['customs'].append(path)
-            if path in store['hidden']:    # 重新添加 = 自动取消隐藏，否则卡片会被静默过滤
-                store['hidden'].remove(path)
-            save_custom_store(store)
-            self.ready.emit(app)
-        except Exception as ex:
-            self.failed.emit(str(ex))
-        finally:
-            if HAVE_COM:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-
-# ============================================================
-# 卡片 / 动画注册表（尺寸与动效 token 见 theme.py）
+# 日志（滚动文件 + 未捕获异常钩子；pythonw 自启时控制台输出会丢失，这是唯一排障通道）
 # ============================================================
 from theme import (CW, CH, GUTTER, GAP, PAD, BAR_H,
                    DUR_FAST, DUR_BASE, DUR_SLOW,
@@ -907,13 +133,14 @@ def _client_area_animation_enabled():
     """Windows「减少动画」辅助功能开关（SPI_GETCLIENTAREAANIMATION）"""
     try:
         enabled = ctypes.c_int(1)
-        _user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0)
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0)
         return bool(enabled.value)
     except Exception:
         return True
 
 
 ANIM_ENABLED = _client_area_animation_enabled()
+AL_QML = os.environ.get('AL_QML', '0') == '1'      # QML GPU 背景层（实验性）
 if not ANIM_ENABLED:               # 尊重系统设置：动效时长归零（仅保留必要的活动指示）
     DUR_FAST = DUR_BASE = DUR_SLOW = 0
 
@@ -1004,6 +231,7 @@ class Card(QWidget):
         self._icon_scale = 1.0
         self._chip_hover = False
         self._icon_anim = None
+        self._edit_selected = False          # 管理模式多选标记
         self.setMouseTracking(True)        # 无按键也接收移动事件 → 图标区悬停动效
         tm = muted_tint(app['tint'])
         self.tintm = tm.name()
@@ -1031,8 +259,7 @@ class Card(QWidget):
 
     def set_icon_scale(self, v):
         self._icon_scale = v
-        self._face = None          # 图标与辉光画在预渲染卡面里，缩放/增强后需重渲染
-        self.update()
+        self.update()               # 图标在 paintEvent 叠加绘制，无需重渲染整张卡面
 
     icon_scale = Property(float, get_icon_scale, set_icon_scale)
 
@@ -1116,6 +343,13 @@ class Card(QWidget):
                     win.remove_card(self)
                 e.accept()
                 return
+            # 管理模式：点击卡片主体 → 切换选中态（批量操作基础）
+            self._edit_selected = not self._edit_selected
+            self.update()
+            if hasattr(win, '_on_edit_selection_changed'):
+                win._on_edit_selection_changed()
+            e.accept()
+            return
         e.ignore()
 
     def _render_face(self):
@@ -1165,25 +399,7 @@ class Card(QWidget):
         p.fillPath(cpath, QColor(CHIP_BG))
         p.setPen(QPen(qc(WHITE, 28), 1))
         p.drawPath(cpath)
-        pm32 = self.app.get('pm_small')
-        if pm32 is not None and not pm32.isNull():
-            # 悬停图标区 → 图标等比放大（预渲染前已按 _icon_scale 缩放），居中保持纵横比
-            isz = 40.0 * self._icon_scale
-            iw, ih = pm32.width(), pm32.height()
-            dw, dh = isz * iw / 40.0, isz * ih / 40.0
-            dx = 11 + (48 - dw) / 2.0
-            dy = 11 + (48 - dh) / 2.0
-            p.drawPixmap(int(round(dx)), int(round(dy)),
-                         max(1, int(round(dw))), max(1, int(round(dh))), pm32)
-        else:
-            # 首字母 + 降饱和主色占位（同步缩放，动效一致）
-            f3 = QFont(FONT_UI)
-            f3.setPixelSize(int(FS_CHIP * self._icon_scale))
-            f3.setBold(True)
-            p.setFont(f3)
-            p.setPen(QColor(self.tintm))
-            p.drawText(chip, Qt.AlignCenter, (self.app['name'] or '?')[0].upper())
-
+        # 图标/首字母改由 paintEvent 叠加绘制（_icon_scale 缩放不再触发整卡面重渲染）
         # 名称 + 主色小条（主色去处 2）+ 元信息（锚定卡面底部 fh）
         f = QFont(FONT_UI)
         f.setPixelSize(FS_BODY)
@@ -1205,6 +421,26 @@ class Card(QWidget):
                    p.fontMetrics().elidedText(meta, Qt.ElideRight, w - 54))
         p.end()
         self._face = pm
+
+    def _draw_icon_glyph(self, p):
+        """在卡面上叠加图标/首字母（paintEvent 调用，受 _icon_scale 缩放控制）"""
+        pm32 = self.app.get('pm_small')
+        if pm32 is not None and not pm32.isNull():
+            isz = 40.0 * self._icon_scale
+            iw, ih = pm32.width(), pm32.height()
+            dw, dh = isz * iw / 40.0, isz * ih / 40.0
+            dx = 11 + (48 - dw) / 2.0
+            dy = 11 + (48 - dh) / 2.0
+            p.drawPixmap(int(round(dx)), int(round(dy)),
+                         max(1, int(round(dw))), max(1, int(round(dh))), pm32)
+        else:
+            f3 = QFont(FONT_UI)
+            f3.setPixelSize(int(FS_CHIP * self._icon_scale))
+            f3.setBold(True)
+            p.setFont(f3)
+            p.setPen(QColor(self.tintm))
+            p.drawText(QRectF(11, 11, 48, 48), Qt.AlignCenter,
+                       (self.app['name'] or '?')[0].upper())
 
     def _tick_spin(self):
         self._spin = (self._spin + 9) % 360
@@ -1232,6 +468,7 @@ class Card(QWidget):
         if self._hover and not self._launching:
             p.translate(0, -lift)
         p.drawPixmap(0, 0, self._face)
+        self._draw_icon_glyph(p)       # 图标层独立叠加（_icon_scale 变化不再触发整卡面重渲染）
 
         w, h = self.width(), self.height()
         fh = h - 8
@@ -1243,6 +480,11 @@ class Card(QWidget):
             p.setPen(QPen(QColor(self.tintm), 6))
             p.drawRoundedRect(rect, R_MD, R_MD)
             p.setPen(QPen(qc(FOCUS_RING, 235), 2))
+            p.drawRoundedRect(rect, R_MD, R_MD)
+        win = self.window()
+        if getattr(win, 'edit_mode', False) and self._edit_selected:
+            # 管理模式选中态：主色描边
+            p.setPen(QPen(QColor(ACCENT), 3))
             p.drawRoundedRect(rect, R_MD, R_MD)
         elif self._hover:
             # 悬停晕染（主色去处 3）：12% 主色罩 + 同色描边
@@ -1638,8 +880,7 @@ class LauncherWindow(QWidget):
         self._tick_clock()
 
         self._launch_timer = QTimer(self)
-        self._launch_timer.timeout.connect(self._tick_launching)
-        self._launch_timer.start(33)
+        self._launch_timer.timeout.connect(self._tick_launching)   # 按需启停（见 on_card_launching）
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -1654,12 +895,23 @@ class LauncherWindow(QWidget):
         self._removed_paths = set()
         self._big_order = []               # 当前持有 pm_big 的 app（≤2 张）
         self._recent = dict(store.get('recent', {}))
+        self._frequent = dict(store.get('frequent', {}))
+        self._sort_mode = store.get('sort_mode', 'recent')
         self._scan_enabled = store['scan_enabled']
         self._scan_gen = 0                 # 扫描代数：迟到事件按代数丢弃（见 _on_batch）
+        self._retiring_workers = []        # 超时未退出的旧扫描线程（引用保活防销毁崩溃）
+        self._undo_stack = []              # remove_card 撤销栈（最多 10 条）
+        self._pending_qml_glow = None      # QML 未就绪时暂存辉光色
         self._adder = None
 
         self.tray = self._make_tray()
         self.tray.show()
+        if AL_QML:
+            self._start_qml_background()
+        # 高 DPI 感知：显示器变更时全部位图缓存失效
+        scr = self.screen()
+        if scr:
+            scr.geometryChanged.connect(self._on_screen_changed)
 
         self.spot_title.setText('正在扫描开始菜单 / 桌面…')
         self.spot_sub.setText('正在提取图标（有缓存时秒开）')
@@ -1678,7 +930,8 @@ class LauncherWindow(QWidget):
             s.move(20 + i * (CW + GAP), 16)
             s.show()
             self._skeletons.append(s)
-        self._skel_timer.start(50)
+        if ANIM_ENABLED:
+            self._skel_timer.start(50)     # 减少动画：骨架静止显示
 
     def _hide_skeletons(self):
         self._skel_timer.stop()
@@ -1720,6 +973,10 @@ class LauncherWindow(QWidget):
         act_solo.toggled.connect(lambda on: self.set_scan_mode(not on))
         act_restore = menu.addAction('恢复全部隐藏的应用')
         act_restore.triggered.connect(self.restore_hidden)
+        act_freq = menu.addAction('按最常用排序')
+        act_freq.setCheckable(True)
+        act_freq.setChecked(self._sort_mode == 'frequent')
+        act_freq.toggled.connect(lambda on: self.set_sort_mode('frequent' if on else 'recent'))
         menu.addSeparator()
         act_quit = menu.addAction('退出')
         act_show.triggered.connect(self.show_from_tray)
@@ -1752,7 +1009,13 @@ class LauncherWindow(QWidget):
             pass
         if self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(2000)
+            if not self.worker.wait(2000):
+                # 限时 wait 不保证线程结束（Qt 文档）：保留引用至自然结束，
+                # 避免替换引用导致 QThread 在运行中被销毁（Fatal）
+                self._retiring_workers.append(self.worker)
+                self.worker.finished.connect(
+                    lambda w=self.worker: self._retiring_workers.remove(w))
+                logging.warning('扫描线程超时未退出，已转入后台等待')
         self.focus_idx = -1
         self._focused_card = None
         for c in self.canvas.cards:
@@ -1816,8 +1079,32 @@ class LauncherWindow(QWidget):
         self.search.setFixedWidth(240)
         self.search.setStyleSheet(SEARCH_QSS)
         self.search.textChanged.connect(lambda _t: self._search_timer.start(150))
-        self.search.returnPressed.connect(self.launch_focused)   # 搜索框回车 = 启动焦点应用
+        self.search.returnPressed.connect(self._search_launch)   # 回车：立即落筛再启动，防抖竞态不再漏筛
+        self.search.installEventFilter(self)                     # Esc 清空搜索
         tl.addWidget(self.search)
+
+        # 窗口操作按钮（无边框窗口的系统控制替代）
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(0)
+        for label, handler, tip, hover_bg in (
+            ('\u2500', self.showMinimized, '最小化', rgba(WHITE_RGB, 25)),
+            ('\u25a1', self._toggle_maximized, '最大化 / 还原', rgba(WHITE_RGB, 25)),
+            ('\u2715', self.close, '关闭', rgba(RED_RGB, 180)),
+        ):
+            b = QPushButton(label)
+            b.setFixedSize(32, 26)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tip)
+            b.setStyleSheet(
+                'QPushButton{background:transparent;border:0;color:%s;font-size:14px;'
+                'border-radius:6px;padding:0;}'
+                'QPushButton:hover{background:%s;color:%s;}'
+                'QPushButton:pressed{background:%s;}' % (
+                    DIM, hover_bg, TEXT, rgba(RED_RGB, 120) if label == '\u2715' else rgba(WHITE_RGB, 40)))
+            b.clicked.connect(handler)
+            btn_row.addWidget(b)
+        tl.addLayout(btn_row)
+
         root.addWidget(top)
         self._top_h = max(56, top.sizeHint().height())
 
@@ -1908,6 +1195,12 @@ class LauncherWindow(QWidget):
         self.btn_manage.setStyleSheet(MENU_MANAGE_QSS)
         self.btn_manage.clicked.connect(self.toggle_edit_mode)
         ml.addWidget(self.btn_manage)
+        self.btn_batch = QPushButton('移除选中')
+        self.btn_batch.setCursor(Qt.PointingHandCursor)
+        self.btn_batch.setStyleSheet(MENU_MANAGE_QSS)
+        self.btn_batch.clicked.connect(self._batch_remove_selected)
+        self.btn_batch.hide()
+        ml.addWidget(self.btn_batch)
         root.addWidget(menu_dock)
 
         # 底栏（悬浮浮岛，去掉硬边线）
@@ -1974,6 +1267,8 @@ class LauncherWindow(QWidget):
         self._bg = None
         self._glow_from_pm = None
         self._glow_to_pm = None
+        if getattr(self, '_bg_layer', None) is not None:
+            self._bg_layer.setGeometry(0, 0, self.width(), self.height())
         hero_h = max(300, min(480, int(self.height() * 0.42)))
         self.hero.setFixedHeight(hero_h)
         if hasattr(self, 'canvas'):
@@ -2007,6 +1302,14 @@ class LauncherWindow(QWidget):
         sb = self.shelf.horizontalScrollBar()
         vp = self.shelf.viewport()
         h = vp.height()
+        sx = sb.value()
+        vw = vp.width()
+        for c in self.canvas.cards:        # 滚动也管理卡面缓存（此前只在 reflow 释放）
+            if c.isHidden():
+                continue
+            x = c.x()
+            if x + CW < sx - CW * 3 or x > sx + vw + CW * 3:
+                c.release_face()
         self._fade_l.setGeometry(0, 0, 48, h)
         self._fade_r.setGeometry(vp.width() - 48, 0, 48, h)
         has_cards = bool(self.canvas.visible_cards())
@@ -2015,6 +1318,8 @@ class LauncherWindow(QWidget):
                                 and sb.value() < sb.maximum())
 
     def paintEvent(self, _ev):
+        if getattr(self, '_bg_layer', None) is not None:
+            return          # QML 背景层已渲染（GPU），跳过 CPU 绘制
         if self._bg is None or self._bg_size != self.size():
             self._rebuild_bg()
         p = QPainter(self)
@@ -2084,6 +1389,7 @@ class LauncherWindow(QWidget):
             self._glow_t = 1.0
             self.update()
             return
+        self._set_qml_glow(color.name())
         self._glow_from_pm = self._render_glow_pm(prev)
         self._glow_to_pm = self._render_glow_pm(color)
         self._glow_t0 = time.time()
@@ -2194,12 +1500,26 @@ class LauncherWindow(QWidget):
                 self.set_focus(vis.index(card), from_hover=True)
 
     # ---------- 最近使用 ----------
+    def set_sort_mode(self, mode):
+        """切换排序模式（recent / frequent）"""
+        if mode == self._sort_mode:
+            return
+        self._sort_mode = mode
+        store = load_custom_store()
+        store['sort_mode'] = mode
+        save_custom_store(store)
+        self._apply_recent_order()
+        self.toast('已切换为「' + ('最常用' if mode == 'frequent' else '最近使用') + '」排序')
+
     def _record_recent(self, path):
         self._recent[path] = time.time()
+        self._frequent[path] = self._frequent.get(path, 0) + 1
         self._recent = prune_recent(self._recent)
         store = load_custom_store()
         store['recent'] = self._recent
-        save_custom_store(store)
+        store['frequent'] = self._frequent
+        if not save_custom_store(store):
+            self.toast('配置保存失败，数据可能不会持久化')
         self._apply_recent_flags()
         self._apply_recent_order()
         if self._focused_card is not None and self._focused_card.app['lnk'] == path:
@@ -2212,16 +1532,22 @@ class LauncherWindow(QWidget):
             c.set_recent(ts > 0 and now - ts < 48 * 3600)
 
     def _apply_recent_order(self, animate=True):
-        """最近使用的排货架最前。顺序无变化时直接返回：
-           每次启动/筛选都重建 ~n 个动画组是纯开销（120 卡 ≈ 300+ QObject）"""
+        """按排序模式排货架（recent=最近使用 / frequent=最常用）。
+           可见性变化必须 reflow；顺序变化时同步 focus_idx。"""
         vis = self.canvas.visible_cards()
-        vis.sort(key=lambda c: (-self._recent.get(c.app['lnk'], 0.0), c.app['name']))
-        rest = [c for c in self.canvas.cards if c not in vis]
-        if [id(c) for c in self.canvas.cards] == [id(c) for c in vis] + [id(c) for c in rest]:
-            return
+        if self._sort_mode == 'frequent':
+            vis.sort(key=lambda c: (-self._frequent.get(c.app['lnk'], 0), c.app['name']))
+        else:
+            vis.sort(key=lambda c: (-self._recent.get(c.app['lnk'], 0.0), c.app['name']))
+        vis_ids = {id(c) for c in vis}
+        rest = [c for c in self.canvas.cards if id(c) not in vis_ids]
+        order_changed = [id(c) for c in self.canvas.cards] != \
+            [id(c) for c in vis] + [id(c) for c in rest]
         self.canvas.cards = vis + rest
         self.canvas.reflow(animate=animate and ANIM_ENABLED)
         self._apply_recent_flags()
+        if order_changed:
+            self._sync_focus_index()
 
     def _ensure_pm_big(self, app):
         """Hero 大图惰性生成：仅焦点 app 常驻 pm_big（≤2 张），按需从主图 PNG 解码"""
@@ -2302,10 +1628,33 @@ class LauncherWindow(QWidget):
             f'&nbsp;·&nbsp;<span>{html.escape(app["cat"])} · {html.escape(tgt)}</span>')
 
     # ---------- 启动 ----------
+    def _sync_focus_index(self):
+        """重排后按焦点卡片对象回算索引，保证 Hero 展示与回车启动一致"""
+        vis = self.visible_cards()
+        if self._focused_card is not None and self._focused_card in vis:
+            self.focus_idx = vis.index(self._focused_card)
+
+    def _search_launch(self):
+        """搜索框回车：立即落筛（不等 150ms 防抖），再启动焦点应用"""
+        self._search_timer.stop()
+        self._apply_filter()
+        self.launch_focused()
+
+    def _search_escape(self):
+        """搜索框 Esc：有内容先清空；空则传播到窗口（最小化）"""
+        if self.search.text():
+            self.search.clear()
+        else:
+            self.showMinimized()
+
     def launch_focused(self):
         vis = self.visible_cards()
-        if 0 <= self.focus_idx < len(vis):
-            self.launch_card(vis[self.focus_idx])
+        card = self._focused_card if (self._focused_card is not None
+                                      and self._focused_card in vis) else None
+        if card is None and 0 <= self.focus_idx < len(vis):
+            card = vis[self.focus_idx]
+        if card is not None:
+            self.launch_card(card)
 
     # ---------- 手动添加 / 移除 ----------
     def add_custom_app(self):
@@ -2325,6 +1674,9 @@ class LauncherWindow(QWidget):
         if self._adder is not None and self._adder.isRunning():
             self.toast('正在添加，请稍候…')     # 右键菜单/空态入口不受 btn_add 禁用保护
             return
+        if self._adder is not None and self._adder.isRunning():
+            self.toast('正在添加，请稍候…')     # 右键菜单/空态入口不受 btn_add 禁用保护
+            return
         if any(c.app['lnk'].lower() == path.lower() for c in self.canvas.cards):
             self.toast('这个应用已经在启动器里了')
             return
@@ -2333,6 +1685,7 @@ class LauncherWindow(QWidget):
         self._adder = AddWorker(path)
         self._adder.ready.connect(self._on_custom_added)
         self._adder.failed.connect(self._on_custom_failed)
+        self._adder.finished.connect(self._drain_pending_adds)   # 竞态兜底：线程结束再调度下一项
         self._adder.start()
 
     def _on_custom_failed(self, msg):
@@ -2356,6 +1709,41 @@ class LauncherWindow(QWidget):
         self.toast(f'已添加 <b>{html.escape(app["name"])}</b>')
         self._drain_pending_adds()
 
+    def _undo_last_remove(self):
+        """撤销上次移除/隐藏（Ctrl+Z）：恢复 custom.json 状态并重启扫描"""
+        if not self._undo_stack:
+            self.toast('没有可撤销的操作')
+            return
+        action = self._undo_stack.pop()
+        path = action['lnk']
+        store = load_custom_store()
+        if path in store['hidden']:
+            store['hidden'].remove(path)
+        if action['was_custom'] and path not in store['customs']:
+            store['customs'].append(path)
+        save_custom_store(store)
+        self._hidden_paths.discard(path)
+        self._removed_paths.discard(path)
+        if action['was_custom']:
+            self._customs_set.add(path)
+        self._restart_worker(self._scan_enabled)
+        self.toast(f'已撤销上次移除（{os.path.basename(path)}）')
+
+    def _batch_remove_selected(self):
+        """管理模式批量移除所有选中的卡片"""
+        selected = [c for c in self.canvas.cards if c._edit_selected and not c.isHidden()]
+        if not selected:
+            self.toast('未选中任何卡片')
+            return
+        for card in selected:
+            self.remove_card(card)
+        self.toast(f'已移除 {len(selected)} 张选中的卡片')
+
+    def _on_edit_selection_changed(self):
+        """管理模式选中数变化 → 更新批量按钮文案"""
+        n = sum(1 for c in self.canvas.cards if c._edit_selected and not c.isHidden())
+        self.btn_batch.setText(f'移除选中 ({n})' if n > 0 else '移除选中')
+
     def _show_card_menu(self, card, gpos):
         menu = QMenu()
         menu.setStyleSheet(QMENU_QSS)
@@ -2372,6 +1760,7 @@ class LauncherWindow(QWidget):
 
     def remove_card(self, card):
         path = card.app['lnk']
+        was_custom = path in self._customs_set
         store = load_custom_store()
         if path in store['customs']:
             store['customs'].remove(path)
@@ -2381,6 +1770,9 @@ class LauncherWindow(QWidget):
         save_custom_store(store)
         self._hidden_paths.add(path)
         self._removed_paths.add(path)
+        self._undo_stack.append({'lnk': path, 'was_custom': was_custom})
+        if len(self._undo_stack) > 10:
+            self._undo_stack.pop(0)
         if card is self._focused_card:
             self._focused_card = None
             self.focus_idx = -1
@@ -2448,10 +1840,13 @@ class LauncherWindow(QWidget):
             self._edit_seeds = []
             if ANIM_ENABLED:
                 self._edit_timer.start(130)
-            self.toast('管理模式 · 点击卡片右上角 × 移除，点「完成」退出')
+            self.btn_batch.show()
+            self.toast('管理模式 · 点击卡片主体选中 / 取消，点 × 移除，点「完成」退出')
         else:
             self._edit_timer.stop()
+            self.btn_batch.hide()
             for c in self.canvas.cards:
+                c._edit_selected = False
                 c.set_rot(0.0)
             self.toast('已退出管理模式')
         for c in self.canvas.cards:
@@ -2465,18 +1860,24 @@ class LauncherWindow(QWidget):
             self._edit_seeds = [(random.uniform(0, math.tau), random.uniform(1.2, 1.8))
                                 for _ in cards]
         for c, (ph, amp) in zip(cards, self._edit_seeds):
-            if not c.isHidden():
+            if not c.isHidden() and not c.visibleRegion().isEmpty():
                 c.set_rot(round(amp * math.sin(ph + self._edit_phase * 1.15), 2))
 
     def _update_empty_state(self):
         if not hasattr(self, 'empty_state'):
             return
-        empty = not self.canvas.visible_cards()
+        vis = self.canvas.visible_cards()
+        empty = not vis
         self.empty_state.setVisible(empty)
+        self.btn_launch.setEnabled(not empty)     # 空态禁用启动/详情，Hero 不再残留旧应用
+        self.btn_info.setEnabled(not empty)
         if empty:
             filtered = bool(self.query) or self.cat != '全部'
             self.empty_state.setText('没有找到匹配的应用\n\n换个关键词，或点击这里清空筛选' if filtered else
                                      '货架空空如也\n\n拖入 .lnk / .exe 文件\n或点击这里添加第一个应用')
+            if filtered:
+                self.spot_title.setText('没有匹配的应用')
+                self.spot_sub.setText('换个关键词，或点击这里清空筛选')
             vp = self.shelf.viewport()
             self.empty_state.setGeometry(24, 8, vp.width() - 48, vp.height() - 18)
 
@@ -2545,8 +1946,12 @@ class LauncherWindow(QWidget):
     def on_card_launching(self, card, on):
         if on and card not in self._launching_cards:
             self._launching_cards.append(card)
+            if not self._launch_timer.isActive():
+                self._launch_timer.start(33)         # 有转圈才跑定时器
         elif not on and card in self._launching_cards:
             self._launching_cards.remove(card)
+            if not self._launching_cards:
+                self._launch_timer.stop()
 
     def _tick_launching(self):
         for c in list(self._launching_cards):
@@ -2556,7 +1961,23 @@ class LauncherWindow(QWidget):
                 self._launching_cards.remove(c)
 
     # ---------- 鼠标（窗口层处理，卡片点击在此派发） ----------
+
+    def eventFilter(self, obj, e):
+        """搜索框 Esc：有内容先清空；空则传播到窗口（最小化）"""
+        if obj is self.search and e.type() == QEvent.KeyPress and e.key() == Qt.Key_Escape:
+            self._search_escape()
+            return True
+        return super().eventFilter(obj, e)
+
     def mousePressEvent(self, e):
+        # 无边框窗口拖拽：顶栏空白区域（非搜索框/按钮）startSystemMove
+        if e.button() == Qt.LeftButton and e.position().y() < self._top_h:
+            child = self.childAt(e.position().toPoint())
+            if child is None or child in (self._top_host, self.clock, self.date):
+                wh = self.windowHandle()
+                if wh:
+                    wh.startSystemMove()
+                return
         if e.button() == Qt.LeftButton:
             self._press_global = e.globalPosition().toPoint()
         elif e.button() == Qt.RightButton:
@@ -2610,6 +2031,12 @@ class LauncherWindow(QWidget):
                                   '应用已启动，启动器已收起（点击托盘图标恢复）',
                                   QSystemTrayIcon.Information, 1500)
 
+    def _toggle_maximized(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
     def show_from_tray(self):
         if getattr(self, '_was_fullscreen', True):
             self.showFullScreen()
@@ -2625,6 +2052,15 @@ class LauncherWindow(QWidget):
             else:
                 self.show_from_tray()
 
+    def _on_screen_changed(self, geo):
+        """显示器变更（DPI / 分辨率）→ 全部位图缓存失效重建"""
+        self._bg = None
+        self._glow_from_pm = None
+        self._glow_to_pm = None
+        for c in self.canvas.cards:
+            c.release_face()
+        self.update()
+
     def _start_ipc_server(self):
         """单实例 IPC：第二个进程启动时经此唤起本窗口"""
         QLocalServer.removeServer(SINGLETON_KEY)    # 清理崩溃残留
@@ -2632,6 +2068,55 @@ class LauncherWindow(QWidget):
         self._ipc_server.listen(SINGLETON_KEY)
         logging.info('IPC: server listening on %s', SINGLETON_KEY)
         self._ipc_server.newConnection.connect(self._on_ipc_connection)
+
+    def _start_qml_background(self):
+        """GPU 加速背景层（QQuickWidget），替代 paintEvent 的 CPU 位图绘制"""
+        try:
+            from PySide6.QtQuickWidgets import QQuickWidget
+            from PySide6.QtCore import QUrl
+            qml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'background.qml')
+            if not os.path.exists(qml_path):
+                return
+            noise_path = os.path.join(CACHE_DIR, 'noise_tile.png')
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            noise_tile().toImage().save(noise_path, 'PNG')
+
+            self._bg_layer = QQuickWidget(self)
+            self._bg_layer.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+            self._bg_layer.setClearColor(Qt.transparent)
+            self._bg_layer.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self._bg_layer.rootContext().setContextProperty(
+                'noisePath', QUrl.fromLocalFile(noise_path).toString())
+            self._bg_layer.setSource(QUrl.fromLocalFile(qml_path))
+            # glowAnimMs 用 rootObject().setProperty 注入（root property 而非 context property）
+            root = self._bg_layer.rootObject()
+            if root:
+                root.setProperty('glowAnimMs', 400 if ANIM_ENABLED else 0)
+            if self._bg_layer.status() == QQuickWidget.Status.Error:
+                for err in self._bg_layer.errors():
+                    logging.warning('QML error: %s', err.toString())
+                self._bg_layer = None
+                return
+            # 补发 QML 加载前暂存的辉光色
+            pending = getattr(self, '_pending_qml_glow', None)
+            if pending:
+                root = self._bg_layer.rootObject()
+                if root:
+                    root.setProperty('gllowColor' if False else 'glowColor', pending)
+            self._bg_layer.setGeometry(0, 0, self.width(), self.height())
+            self._bg_layer.show()
+            self._bg_layer.lower()
+        except Exception:
+            logging.exception('QML 背景层初始化失败，回退 CPU 绘制')
+            self._bg_layer = None
+
+    def _set_qml_glow(self, color_hex):
+        """通知 QML 层更新辉光颜色（root object property，绑定会自动重评估）"""
+        layer = getattr(self, '_bg_layer', None)
+        if layer is not None and layer.rootObject():
+            layer.rootObject().setProperty('glowColor', color_hex)
+        elif layer is not None:
+            self._pending_qml_glow = color_hex   # QML 未就绪：暂存，加载完成后补发
 
     def _on_ipc_connection(self):
         logging.info('IPC: newConnection')
@@ -2667,6 +2152,8 @@ class LauncherWindow(QWidget):
             except Exception:
                 pass
             self.worker.wait(2500)
+            if self.worker.isRunning():
+                logging.warning('退出时扫描线程未按时结束，进程将强制回收')
         if self.tray.isVisible():
             self.tray.hide()
         super().closeEvent(e)
@@ -2727,6 +2214,8 @@ class LauncherWindow(QWidget):
         k = e.key()
         if k == Qt.Key_Q and (e.modifiers() & Qt.ControlModifier):
             self.close()
+        elif k == Qt.Key_Z and (e.modifiers() & Qt.ControlModifier):
+            self._undo_last_remove()
         elif k == Qt.Key_Escape:
             if self.edit_mode:
                 self.set_edit_mode(False)
